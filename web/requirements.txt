@@ -1,0 +1,7 @@
+opencv-python
+ultralytics
+requests
+pymongo
+python-dotenv
+python-multipart==0.0.20
+httpx
