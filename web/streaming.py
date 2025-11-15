@@ -18,8 +18,8 @@ col = db['sleepy']
 model = YOLO("./models/bestM.pt")
 
 CONF_THRES = 0.30
-IMGSZ = 640
-EAR_THRESH = 0.19
+IMGSZ = 480
+EAR_THRESH = 0.195
 SMOOTH_N = 5
 SAVE_INTER_SEC = 0.7
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -54,20 +54,36 @@ def _placeholder(text: str = "Waiting for frames...") -> bytes:
 
 def generate():
     global lastsave_ts
+    last_frame = None
+    last_sent_ts = 0.0
+    TARGET_FPS = 10
+    MIN_INTERVAL = 1.0 / TARGET_FPS   # 0.1초
+
     while True:
         image_bytes = latest_frame
+
+        # 프레임 아예 없으면 placeholder만 천천히 뿌리기
         if not image_bytes:
             frame_bytes = _placeholder()
             yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            time.sleep(0.1)
+            continue
+        now = time.time()
+        if image_bytes is last_frame:
+            time.sleep(0.01)
             continue
 
+        if now - last_sent_ts < MIN_INTERVAL:
+            time.sleep(0.005)
+            continue
+        last_frame = image_bytes
+        last_sent_ts = now
         arr = np.frombuffer(image_bytes, np.uint8)
         frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if frame is None:
             frame_bytes = _placeholder("Invalid frame")
             yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
             continue
-
         h, w = frame.shape[:2]
         yolo_res = model(frame, conf=CONF_THRES, imgsz=IMGSZ)
         frame = yolo_res[0].plot()
@@ -77,8 +93,10 @@ def generate():
 
         if results.multi_face_landmarks:
             lm = results.multi_face_landmarks[0].landmark
+
             def to_xy(idx):
                 return (lm[idx].x * w, lm[idx].y * h)
+
             right_eye_pts = [to_xy(i) for i in RIGHT_EYE_IDXS]
             left_eye_pts  = [to_xy(i) for i in LEFT_EYE_IDXS]
             ear_r = eye_ear(right_eye_pts)
@@ -91,27 +109,43 @@ def generate():
         if len(ear_hist) > 0:
             ear_smooth = sum(ear_hist) / len(ear_hist)
             status = "OPEN" if ear_smooth >= EAR_THRESH else "CLOSED"
-            now = time.time()
-            if now - lastsave_ts >= SAVE_INTER_SEC:
-                doc = {"timestamp": datetime.datetime.utcnow(), "ear_smooth": float(ear_smooth), "status": status}
+            now_ts = time.time()
+            if now_ts - lastsave_ts >= SAVE_INTER_SEC:
+                doc = {
+                    "timestamp": datetime.datetime.utcnow(),
+                    "ear_smooth": float(ear_smooth),
+                    "status": status
+                }
                 try:
                     col.insert_one(doc)
-                    lastsave_ts = now
+                    lastsave_ts = now_ts
                 except Exception as e:
                     print(f"[Mongo] insert failed: {e}")
 
-            cv2.putText(frame, f"EAR: {ear_smooth:.3f}  [{status}]",
-                        (10, 30), FONT, 0.8, (0, 255, 0) if status=="OPEN" else (0, 0, 255), 2)
+            cv2.putText(
+                frame,
+                f"EAR: {ear_smooth:.3f}  [{status}]",
+                (10, 30),
+                FONT, 0.8,
+                (0, 255, 0) if status == "OPEN" else (0, 0, 255),
+                2,
+            )
 
             bar_max = 200
             ear_clamped = max(0.0, min(0.4, ear_smooth))
             bar_len = int((ear_clamped / 0.4) * bar_max)
             cv2.rectangle(frame, (10, 40), (10 + bar_max, 60), (50, 50, 50), 1)
-            cv2.rectangle(frame, (10, 40), (10 + bar_len, 60),
-                          (0, 255, 0) if status=="OPEN" else (0, 0, 255), -1)
+            cv2.rectangle(
+                frame,
+                (10, 40), (10 + bar_len, 60),
+                (0, 255, 0) if status == "OPEN" else (0, 0, 255),
+                -1,
+            )
         else:
             cv2.putText(frame, "EAR: -- (no face)", (10, 30), FONT, 0.8, (0, 255, 255), 2)
 
-        ok, buffer = cv2.imencode('.jpg', frame)
+        ok, buffer = cv2.imencode(".jpg", frame)
         frame_bytes = buffer.tobytes() if ok else _placeholder("Encode failed")
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
+

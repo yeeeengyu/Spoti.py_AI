@@ -1,5 +1,7 @@
-from fastapi import FastAPI, UploadFile, File, Request, Header, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, Request, Depends, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import Header
 from pymongo import MongoClient
 from dotenv import load_dotenv
 from streaming import push_frame, generate
@@ -9,17 +11,13 @@ import os
 load_dotenv()
 MONGODB_URL = os.getenv("MONGODB_URL")
 NEST_BASE_URL = os.getenv("NEST_BASE_URL", "https://your-nest.example.com")
+security = HTTPBearer(bearerFormat="JWT")
 
 client = MongoClient(MONGODB_URL)
-db = client['spotipy']
-col = db['sleepy']
+db = client["spotipy"]
+col = db["sleepy"]
 
 app = FastAPI()
-
-def _require_bearer(authorization: str | None) -> str:
-    if authorization is None or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid token")
-    return authorization  # 'Bearer xxx' 문자열 그대로 반환
 
 @app.get("/")
 async def root():
@@ -33,9 +31,9 @@ async def stream():
 async def upload(
     request: Request,
     file: UploadFile | None = File(None),
-    authorization: str | None = Header(None),
+    credentials: HTTPAuthorizationCredentials = Depends(security), 
 ):
-    _ = _require_bearer(authorization)
+    auth = f"Bearer {credentials.credentials}"
     image_bytes = await (file.read() if file else request.body())
     if not image_bytes:
         return JSONResponse({"ok": False, "error": "empty body"}, status_code=400)
@@ -44,30 +42,42 @@ async def upload(
 
 @app.post("/statistic")
 async def statistic(
-    authorization: str | None = Header(None),
-    limit: int = Query(50, ge=1, le=500),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
-    # 1) 토큰 확인
-    auth = _require_bearer(authorization)
+    auth = f"Bearer {credentials.credentials}"
 
-    # 2) DB 조회
-    docs = list(col.find().sort("timestamp", -1).limit(limit))
+    docs = list(col.find().sort("timestamp", -1).limit(21))
     for d in docs:
         d["_id"] = str(d["_id"])
 
-    # 3) Nest로 포워딩 (토큰은 Authorization 헤더, 데이터는 JSON 바디)
     url = f"{NEST_BASE_URL}/statistic"
-    payload = {"data": docs}  # Nest에서 기대하는 키 이름에 맞춰주세요
+    payload = {"data": docs}
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.post(
-                url,
-                headers={"Authorization": auth},
-                json=payload,
-            )
-        # Nest 응답 그대로 전달(필요 시 가공 가능)
-        content = r.json() if r.headers.get("content-type", "").startswith("application/json") and r.content else {"ok": r.is_success}
+            r = await client.post(url, headers={"Authorization": auth}, json=payload)
+        content = (
+            r.json()
+            if r.headers.get("content-type", "").startswith("application/json") and r.content
+            else {"ok": r.is_success}
+        )
         return JSONResponse(status_code=r.status_code, content=content)
     except httpx.RequestError as e:
-        # 네트워크/타임아웃 등 오류 처리
         return JSONResponse(status_code=502, content={"ok": False, "error": f"nest_unreachable: {str(e)}"})
+
+@app.get("/latest-status")
+async def latest_status(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    # 필요하면 토큰 꺼내서 쓰면 됨
+    # token = credentials.credentials
+
+    doc = col.find_one(sort=[("timestamp", -1)])
+
+    if not doc:
+        return {"ok": True, "status": None}
+
+    return {
+        "ok": True,
+        "status": doc.get("status"),
+        "timestamp": doc.get("timestamp")
+    }
