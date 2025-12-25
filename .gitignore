@@ -2,4 +2,5 @@ drowsiness/*
 eyes-1/*
 final2-1/*
 .venv/*
+web/.env
 __pycache__/*
